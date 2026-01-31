@@ -1,0 +1,241 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Identity and Organization Entities
+model User {
+  id                String             @id @default(uuid())
+  email             String             @unique
+  passwordHash      String             @map("password_hash")
+  phone             String?
+  isEmailVerified   Boolean            @default(false) @map("is_email_verified")
+  isPhoneVerified   Boolean            @default(false) @map("is_phone_verified")
+  role              UserRole           @default(CUSTOMER)
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  
+  organizerProfile  OrganizerProfile?
+  orders            Order[]
+  
+  @@map("users")
+}
+
+model OrganizerProfile {
+  id                String             @id @default(uuid())
+  userId            String             @unique @map("user_id")
+  displayName       String             @map("display_name")
+  description       String?
+  logoUrl           String?            @map("logo_url")
+  website           String?
+  socialLinks       Json?              @map("social_links")
+  isVerified        Boolean            @default(false) @map("is_verified")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentRecipient  PaymentRecipient?
+  events            Event[]
+  
+  @@map("organizer_profiles")
+}
+
+// Payment recipient for Pagar.me integration
+model PaymentRecipient {
+  id                String             @id @default(uuid())
+  organizerId       String             @unique @map("organizer_id")
+  recipientId       String             @unique @map("recipient_id") // Pagar.me recipient ID (re_...)
+  gatewayStatus     String             @map("gateway_status")
+  bankAccountStatus String?            @map("bank_account_status")
+  lastSyncedAt      DateTime?          @map("last_synced_at")
+  metadata          Json?              // Store complete Pagar.me response for audit
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  
+  organizer         OrganizerProfile   @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  splitRuleLogs     SplitRuleLog[]
+  
+  @@map("payment_recipients")
+}
+
+// Event Catalog with JSONB for flexibility
+model Event {
+  id                String             @id @default(uuid())
+  slug              String             @unique
+  organizerId       String             @map("organizer_id")
+  title             String
+  status            EventStatus        @default(DRAFT)
+  startDate         DateTime           @map("start_date")
+  endDate           DateTime           @map("end_date")
+  location          String?
+  // JSONB field for flexible event details (description, agenda, FAQ, settings, assets)
+  details           Json               @default("{}")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  
+  organizer         OrganizerProfile   @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  ticketTypes       TicketType[]
+  
+  @@index([slug])
+  @@index([status])
+  @@index([startDate])
+  // GIN index for JSONB queries (e.g., searching by category, tags)
+  @@index([details], type: Gin)
+  @@map("events")
+}
+
+model TicketType {
+  id                String             @id @default(uuid())
+  eventId           String             @map("event_id")
+  name              String
+  description       String?
+  price             Int                // Price in cents
+  quantity          Int                // Total available
+  available         Int                // Remaining available
+  salesStartDate    DateTime?          @map("sales_start_date")
+  salesEndDate      DateTime?          @map("sales_end_date")
+  minPerOrder       Int                @default(1) @map("min_per_order")
+  maxPerOrder       Int                @default(10) @map("max_per_order")
+  isActive          Boolean            @default(true) @map("is_active")
+  // Custom form fields for ticket (e.g., T-shirt size, dietary restrictions)
+  customFields      Json?              @map("custom_fields")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  
+  event             Event              @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  orderItems        OrderItem[]
+  
+  @@map("ticket_types")
+}
+
+// Financial Entities - Immutable once created
+model Order {
+  id                String             @id @default(uuid())
+  userId            String             @map("user_id")
+  orderNumber       String             @unique @map("order_number")
+  totalAmount       Int                @map("total_amount") // Total in cents
+  status            OrderStatus        @default(PENDING)
+  expiresAt         DateTime?          @map("expires_at") // For pending orders
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  
+  user              User               @relation(fields: [userId], references: [id])
+  items             OrderItem[]
+  transactions      Transaction[]
+  
+  @@index([userId])
+  @@index([status])
+  @@map("orders")
+}
+
+model OrderItem {
+  id                String             @id @default(uuid())
+  orderId           String             @map("order_id")
+  ticketTypeId      String             @map("ticket_type_id")
+  quantity          Int
+  unitPrice         Int                @map("unit_price") // Price snapshot at purchase time (cents)
+  subtotal          Int                // quantity * unitPrice
+  // Custom form answers (JSONB for flexible structure)
+  answers           Json?
+  createdAt         DateTime           @default(now()) @map("created_at")
+  
+  order             Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  ticketType        TicketType         @relation(fields: [ticketTypeId], references: [id])
+  
+  @@map("order_items")
+}
+
+// Transaction records for payment gateway
+model Transaction {
+  id                String             @id @default(uuid())
+  orderId           String             @map("order_id")
+  gatewayId         String?            @unique @map("gateway_id") // Pagar.me transaction ID (tid)
+  paymentMethod     PaymentMethod      @map("payment_method")
+  status            TransactionStatus  @default(PENDING)
+  amount            Int                // Amount in cents
+  installments      Int                @default(1)
+  // Idempotency key for safe retries
+  idempotencyKey    String             @unique @map("idempotency_key")
+  // Snapshot of split rules applied at transaction time (audit trail)
+  splitSnapshot     Json?              @map("split_snapshot")
+  // Raw gateway response for debugging
+  gatewayMetadata   Json?              @map("gateway_metadata")
+  errorMessage      String?            @map("error_message")
+  createdAt         DateTime           @default(now()) @map("created_at")
+  updatedAt         DateTime           @updatedAt @map("updated_at")
+  
+  order             Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  splitRuleLogs     SplitRuleLog[]
+  
+  @@index([orderId])
+  @@index([status])
+  @@map("transactions")
+}
+
+// Audit log for payment splits (marketplace transparency)
+model SplitRuleLog {
+  id                String             @id @default(uuid())
+  transactionId     String             @map("transaction_id")
+  recipientId       String             @map("recipient_id")
+  recipientType     RecipientType      @map("recipient_type")
+  amount            Int                // Split amount in cents
+  percentage        Float?             // If split by percentage
+  liable            Boolean            // Chargeback responsibility
+  chargeProcessingFee Boolean          @map("charge_processing_fee") // Who pays MDR
+  createdAt         DateTime           @default(now()) @map("created_at")
+  
+  transaction       Transaction        @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  paymentRecipient  PaymentRecipient?  @relation(fields: [recipientId], references: [recipientId])
+  
+  @@map("split_rule_logs")
+}
+
+// Enums
+enum UserRole {
+  CUSTOMER
+  ORGANIZER
+  ADMIN
+}
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  CANCELLED
+  SUSPENDED
+  COMPLETED
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FAILED
+  CANCELED
+  REFUNDED
+}
+
+enum TransactionStatus {
+  PENDING
+  AUTHORIZED
+  PAID
+  REFUNDED
+  FAILED
+  CANCELED
+}
+
+enum PaymentMethod {
+  CREDIT_CARD
+  DEBIT_CARD
+  PIX
+  BOLETO
+}
+
+enum RecipientType {
+  PLATFORM
+  ORGANIZER
+}
